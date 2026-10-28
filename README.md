@@ -188,7 +188,9 @@ processo:
 - séries de latência e custo acumulado.
 
 As métricas ficam somente em memória e são zeradas quando o servidor reinicia.
-Prompts, respostas, chaves e tokens não são armazenados pelo coletor.
+Prompts, respostas e chaves não são armazenados pelo coletor. Apenas as
+contagens de tokens e os demais metadados operacionais necessários ao painel
+ficam em memória.
 
 Para habilitar traces externos no LangSmith, copie as variáveis da seção
 LangSmith de `.env.example` para o seu `.env` local e substitua somente

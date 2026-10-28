@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+gcp-oauth.keys.json
+google-calendar.token.json
