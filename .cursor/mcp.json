@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "assessor-financeiro": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": [
+        "app\\mcp_server.py"
+      ]
+    }
+  }
+}
