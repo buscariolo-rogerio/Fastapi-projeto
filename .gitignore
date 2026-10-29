@@ -1,6 +1,56 @@
+# Segredos e configuração local
 .env
-.venv/
-__pycache__/
-*.py[cod]
+.env.*
+!.env.example
+!**/.env.example
 gcp-oauth.keys.json
 google-calendar.token.json
+*.token.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python e ambientes locais
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+build/
+dist/
+
+# Testes e relatórios gerados
+tests/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Especificações mantidas apenas no workspace local
+specs/
+
+# Ferramentas locais de desenvolvimento
+/.agents/
+/.cursor/
+/.vscode/
+.idea/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.ipynb_checkpoints/
+node_modules/
+
+# Logs, bancos temporários e arquivos do sistema
+*.log
+logs/
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+Thumbs.db
+*.swp

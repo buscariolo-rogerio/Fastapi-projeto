@@ -2,6 +2,7 @@ import json
 import operator
 import re
 import ast
+import logging
 from datetime import datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo
@@ -17,7 +18,7 @@ from app.guardrail import (
     limpar_raciocinio,
     normalizar_resposta_usuario,
 )
-from app.juiz import no_juiz
+from app.juiz import FRASE_SEGURA, no_juiz
 from langchain_core.messages import RemoveMessage
 from langchain_core.runnables import RunnableConfig
 from app.llms import llm, llm_rapido
@@ -26,7 +27,7 @@ from app.observabilidade import abrir_turno, fechar_turno, status_do_estado
 from app.tools.memoria import TOOLS_MEMORIA
 from app.tools.perfil import buscar_perfil
 from app.tools.agenda import TOOLS_AGENDA
-from app.tools.calendario_google import TOOLS_GOOGLE
+from app.turn_transaction import register_turn, transaction_for, unregister_turn
 from app.prompts import (
     ROUTER_PROMPT_COMPLETO,
     FINANCEIRO_PROMPT_COMPLETO,
@@ -57,7 +58,7 @@ financeiro_app = create_agent(
 # AGENDA
 agenda_app = create_agent(
     model=llm,
-    tools=TOOLS_AGENDA + TOOLS_GOOGLE + TOOLS_MEMORIA,
+    tools=TOOLS_AGENDA + TOOLS_MEMORIA,
     system_prompt=AGENDA_PROMPT_COMPLETO,
 )
 
@@ -81,6 +82,12 @@ class Estado(MessagesState):
     agentes_chamados:   Annotated[list[str], operator.add]  # acumula entre nós
     rota: str                                  # decisão do roteador
     mapa_pii: dict #tokens -> valores originais gerados na anonimização
+    veredito_turno: str
+    resultado_transacao: str
+    evidencias_tools: list[dict]
+
+
+logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
@@ -230,7 +237,21 @@ def _resposta_transacao_registrada(resultado: dict) -> str:
     return f"Registrei a transação de R$ {_numero_pt_br(valor_brl)} no banco de dados."
 
 
-def _fallback_insercao(texto: str) -> dict | None:
+def _evidencia_add_transaction(resultado: dict) -> dict:
+    """Limita a evidência externa aos campos autorizados para julgamento."""
+    campos = (
+        "status",
+        "id",
+        "amount_brl",
+        "original_amount",
+        "original_currency",
+        "exchange_rate",
+        "rate_date",
+    )
+    return {campo: resultado[campo] for campo in campos if campo in resultado}
+
+
+def _fallback_insercao(texto: str, config: RunnableConfig) -> tuple[dict, dict] | None:
     valor = _valor_insercao(texto)
     if valor is None:
         return None
@@ -244,21 +265,23 @@ def _fallback_insercao(texto: str) -> dict | None:
         "occurred_at": ocorreu_em,
         "type_name": tipo,
         "description": texto,
-    })
+    }, config=config)
     if resultado.get("status") == "ok":
-        return {
+        especialista = {
             "dominio": "financeiro",
             "intencao": "inserir",
             "resposta": _resposta_transacao_registrada(resultado),
             "recomendacao": "",
             "escrita": {"operacao": "adicionar", "id": resultado.get("id")},
         }
-    return {
+        return especialista, resultado
+    especialista = {
         "dominio": "financeiro",
         "intencao": "inserir",
         "resposta": "Não consegui registrar essa transação no banco de dados.",
         "recomendacao": "Tente novamente em instantes.",
     }
+    return especialista, resultado
 
 
 def _json_especialista_valido(texto: str) -> bool:
@@ -328,6 +351,33 @@ def _ultimo_resultado_tool(mensagens, nome_tool: str) -> dict | None:
     return None
 
 
+def _abortar_se_tool_falhou(mensagens, config: RunnableConfig) -> None:
+    """Uma falha reportada por qualquer tool invalida escritas do mesmo turno."""
+    tx = transaction_for(config)
+    if tx is None:
+        return
+    for mensagem in mensagens:
+        tipo = mensagem.get("role") if isinstance(mensagem, dict) else getattr(mensagem, "type", "")
+        if tipo != "tool":
+            continue
+        conteudo = mensagem.get("content", "") if isinstance(mensagem, dict) else getattr(mensagem, "content", "")
+        if isinstance(conteudo, dict):
+            resultado = conteudo
+        elif isinstance(conteudo, str):
+            try:
+                resultado = json.loads(conteudo)
+            except json.JSONDecodeError:
+                try:
+                    resultado = ast.literal_eval(conteudo)
+                except (ValueError, SyntaxError):
+                    continue
+        else:
+            continue
+        if isinstance(resultado, dict) and resultado.get("status") == "error":
+            tx.abort("financeiro_tool_error")
+            return
+
+
 def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
     """Executa o especialista e impede uma resposta sem consulta em saldo total."""
     indice = _indice_ultima_mensagem_usuario(estado["messages"])
@@ -355,6 +405,9 @@ def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
             config=config,
         )
     except Exception:
+        tx = transaction_for(config)
+        if tx:
+            tx.abort("financeiro_exception")
         return {
             "agentes_chamados": ["financeiro"],
             "messages": [{
@@ -370,6 +423,7 @@ def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
     mensagens = saida.get("messages", [])
     indice_usuario = _indice_ultima_mensagem_usuario(mensagens)
     mensagens_do_turno = mensagens[indice_usuario + 1:] if indice_usuario >= 0 else mensagens
+    _abortar_se_tool_falhou(mensagens_do_turno, config)
     chamou_tool = any(
         (mensagem.get("role") if isinstance(mensagem, dict) else getattr(mensagem, "type", "")) == "tool"
         for mensagem in mensagens_do_turno
@@ -423,6 +477,7 @@ def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
         return {
             "agentes_chamados": ["financeiro"],
             "messages": [{"role": "assistant", "content": json.dumps(especialista, ensure_ascii=False)}],
+            "evidencias_tools": [],
         }
 
     # Para inserções simples, se o modelo não emitiu a chamada da tool,
@@ -430,6 +485,7 @@ def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
     # Se faltar valor ou a intenção não for clara, não fazemos nenhuma escrita.
     if _eh_pedido_de_insercao(pergunta):
         resultado_adicao = _ultimo_resultado_tool(mensagens_do_turno, "add_transaction")
+        evidencia_adicao = resultado_adicao
         if resultado_adicao and resultado_adicao.get("status") == "ok":
             especialista = {
                 "dominio": "financeiro",
@@ -439,19 +495,32 @@ def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
                 "escrita": {"operacao": "adicionar", "id": resultado_adicao.get("id")},
             }
         elif not chamou_tool:
-            especialista = _fallback_insercao(pergunta)
+            fallback = _fallback_insercao(pergunta, config)
+            if fallback is None:
+                especialista = None
+            else:
+                especialista, evidencia_adicao = fallback
         else:
             especialista = None
         if especialista is not None:
+            evidencias_tools = (
+                [{"name": "add_transaction", "content": json.dumps(_evidencia_add_transaction(evidencia_adicao), ensure_ascii=False)}]
+                if evidencia_adicao is not None
+                else []
+            )
             return {
                 "agentes_chamados": ["financeiro"],
                 "messages": [{"role": "assistant", "content": json.dumps(especialista, ensure_ascii=False)}],
+                "evidencias_tools": evidencias_tools,
             }
 
     # Uma operação financeira não pode terminar com texto de prontidão,
     # instruções internas ou qualquer saída que não seja o JSON contratado.
     # Nesse caso nenhuma escrita é considerada confirmada.
     if _parece_operacao_financeira(pergunta) and texto_financeiro and not _json_especialista_valido(texto_financeiro):
+        tx = transaction_for(config)
+        if tx and tx.writes:
+            tx.abort("financeiro_resposta_invalida")
         return {
             "agentes_chamados": ["financeiro"],
             "messages": [{
@@ -463,6 +532,7 @@ def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
                     "recomendacao": "Tente novamente; nenhuma alteração foi confirmada.",
                 }, ensure_ascii=False),
             }],
+            "evidencias_tools": [],
         }
 
     return saida
@@ -544,6 +614,8 @@ def decidir_pos_guardrail_entrada(estado: Estado) -> str:
 
 def no_guardrail_entrada(estado: Estado, config: RunnableConfig) -> dict:
     """Executa o guardrail de entrada e decide se o fluxo continua ou é bloqueado."""
+    if transaction_for(config) is None:
+        raise RuntimeError("O turno do chat precisa de uma transação gerenciada.")
 
     puser = estado["messages"][-1]
 
@@ -585,6 +657,7 @@ def no_guardrail_entrada(estado: Estado, config: RunnableConfig) -> dict:
                 "content": mensagem_anonimizada,
             },
         ],
+        "evidencias_tools": [],
     }
     
 def no_guardrail_saida(estado: Estado) -> dict:
@@ -605,6 +678,81 @@ def no_guardrail_saida(estado: Estado) -> dict:
     }
 
 
+def _substituir_mensagens_provisorias(estado: Estado, resposta: str) -> list:
+    indice = _indice_ultima_mensagem_usuario(estado["messages"])
+    removidas = []
+    for mensagem in estado["messages"][indice + 1:]:
+        identificador = mensagem.get("id") if isinstance(mensagem, dict) else getattr(mensagem, "id", None)
+        if identificador:
+            removidas.append(RemoveMessage(id=identificador))
+    return [*removidas, {"role": "assistant", "content": resposta}]
+
+
+def decidir_finalizacao(estado: Estado, config: RunnableConfig) -> str:
+    """Escolhe o caminho do grafo pelo veredito explícito e pelo estado do turno."""
+    tx = transaction_for(config)
+    if tx is None:
+        raise RuntimeError("A transação do chat não está disponível.")
+    return "commit" if estado.get("veredito_turno") == "aprovado" and not tx.aborted else "rollback"
+
+
+def no_commit_transacao(estado: Estado, config: RunnableConfig) -> dict:
+    """Confirma a transação aprovada sem expor uma tool adicional ao LLM."""
+    tx = transaction_for(config)
+    if tx is None:
+        raise RuntimeError("A transação do chat não está disponível.")
+    resultado = tx.finish(True)
+    if resultado in ("committed", "no_write") and not tx.aborted:
+        return {
+            "resultado_transacao": "committed" if resultado == "committed" else "no_write",
+            "evidencias_tools": [],
+        }
+    if resultado == "uncertain":
+        resposta = "Não consegui confirmar o resultado no banco. Consulte os registros antes de repetir o pedido."
+        estado_resultado = "uncertain"
+    elif resultado == "rollback_uncertain":
+        resposta = "Não consegui confirmar o desfazimento no banco. Consulte os registros antes de repetir o pedido."
+        estado_resultado = "erro"
+    else:
+        resposta = "Não consegui concluir a operação no banco de dados. Consulte os registros antes de repetir o pedido."
+        estado_resultado = "erro"
+    return {
+        "resultado_transacao": estado_resultado,
+        "evidencias_tools": [],
+        "messages": _substituir_mensagens_provisorias(estado, resposta),
+    }
+
+
+def no_rollback_transacao(estado: Estado, config: RunnableConfig) -> dict:
+    """Desfaz a transação recusada ou abortada e substitui a resposta provisória."""
+    tx = transaction_for(config)
+    if tx is None:
+        raise RuntimeError("A transação do chat não está disponível.")
+    resultado = tx.finish(False)
+    if resultado == "rollback_uncertain":
+        return {
+            "resultado_transacao": "erro",
+            "evidencias_tools": [],
+            "messages": _substituir_mensagens_provisorias(
+                estado,
+                "Não consegui confirmar o desfazimento no banco. Consulte os registros antes de repetir o pedido.",
+            ),
+        }
+    if tx.aborted:
+        return {
+            "resultado_transacao": "erro",
+            "evidencias_tools": [],
+            "messages": _substituir_mensagens_provisorias(
+                estado,
+                "Não consegui concluir a operação no banco de dados. Nenhuma escrita foi confirmada.",
+            ),
+        }
+    return {
+        "resultado_transacao": "rolled_back" if resultado == "rolled_back" else "no_write",
+        "evidencias_tools": [],
+    }
+
+
 # ==============================================================================
 # CONSTRUÇÃO DO GRAFO
 # ==============================================================================
@@ -618,6 +766,8 @@ grafo.add_node("faq",          faq_app)
 grafo.add_node("orquestrador", no_orquestrador)
 grafo.add_node("guardrail_saida", no_guardrail_saida)
 grafo.add_node("juiz", no_juiz)
+grafo.add_node("commit_transacao", no_commit_transacao)
+grafo.add_node("rollback_transacao", no_rollback_transacao)
 
 grafo.set_entry_point("guardrail_entrada")
 
@@ -646,7 +796,16 @@ grafo.add_edge("agenda",       "orquestrador")
 grafo.add_edge("orquestrador", "guardrail_saida")
 grafo.add_edge("guardrail_saida", "juiz")
 grafo.add_edge("faq",          "juiz")   # FAQ bypassa o orquestrador, mas não o juiz
-grafo.add_edge("juiz",         END)
+grafo.add_conditional_edges(
+    "juiz",
+    decidir_finalizacao,
+    {
+        "commit": "commit_transacao",
+        "rollback": "rollback_transacao",
+    },
+)
+grafo.add_edge("commit_transacao", END)
+grafo.add_edge("rollback_transacao", END)
 
 # Memória centralizada no grafo — persiste o Estado inteiro entre turns
 memory = MemorySaver()
@@ -665,10 +824,14 @@ def executar_fluxo_assessor_detalhado(
         "agentes_chamados": [],
         "rota": "",
         "mapa_pii": {},
+        "veredito_turno": "",
+        "resultado_transacao": "",
+        "evidencias_tools": [],
         "session_id": session_id,
     }
     
     turno_id = abrir_turno()
+    transacao = register_turn()
     status = "erro"
     rota = ""
     try:
@@ -678,6 +841,7 @@ def executar_fluxo_assessor_detalhado(
                 "configurable": {
                     "thread_id": session_id,
                     "user_id": user_id,
+                    "chat_transaction_id": transacao.id,
                 }
             },
         )
@@ -685,16 +849,22 @@ def executar_fluxo_assessor_detalhado(
         resposta_bruta = _texto_mensagem(estado_final["messages"][-1])
         resposta = _formatar_resposta_especialista(resposta_bruta) or normalizar_resposta_usuario(resposta_bruta)
         # A entrada já foi persistida de forma anonimizada no guardrail de entrada.
-        salvar_mensagem(
-            session_id,
-            "assistant",
-            resposta,
-            user_id=user_id or session_id,
-        )
+        try:
+            salvar_mensagem(
+                session_id,
+                "assistant",
+                resposta,
+                user_id=user_id or session_id,
+            )
+        except Exception as exc:
+            # O commit já terminou. Falha de histórico não deve trocar uma
+            # confirmação real por uma mensagem de erro que induza repetição.
+            logger.warning("Falha ao salvar resposta já confirmada no histórico: %s", type(exc).__name__)
         status = status_do_estado(estado_final)
         rota = estado_final.get("rota") or ""
         return resposta, estado_final.get("agentes_chamados", [])
     finally:
+        unregister_turn(transacao)
         fechar_turno(turno_id, session_id=session_id, rota=rota, status=status)
 
 

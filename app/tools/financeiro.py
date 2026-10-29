@@ -1,8 +1,10 @@
 import logging
+from contextlib import nullcontext
 from datetime import date
 from math import isfinite
 from typing import Optional, List
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from app.currency import (
     CurrencyConversionError,
@@ -11,6 +13,7 @@ from app.currency import (
     normalizar_codigo_moeda,
 )
 from app.tools.db import get_conn
+from app.turn_transaction import TurnTransaction, connection_for_read, transaction_for
 
 logger = logging.getLogger(__name__)
 
@@ -210,8 +213,7 @@ def _get_category_id(cur, category_id: Optional[int], category_name: Optional[st
 
 
 # Tool: add_transaction
-@tool("add_transaction", args_schema=AddTransactionArgs)
-def add_transaction(
+def _add_transaction_impl(
     amount: float,
     source_text: str,
     currency: Optional[str] = None,
@@ -222,6 +224,7 @@ def add_transaction(
     category_name: Optional[str] = None,
     description: Optional[str] = None,
     payment_method: Optional[str] = None,
+    tx: TurnTransaction | None = None,
 ) -> dict:
     """Converte a moeda de origem para BRL e insere a transação no Postgres."""
     valor_original = _validar_valor(amount)
@@ -250,7 +253,7 @@ def add_transaction(
     conn = None
     cur = None
     try:
-        conn = get_conn()
+        conn = tx.conn() if tx else get_conn()
         cur = conn.cursor()
         resolved_type_id = _resolve_type_id(cur, type_id, type_name)
         if resolved_type_id is None:
@@ -287,7 +290,8 @@ def add_transaction(
             )
 
         new_id, occurred = cur.fetchone()
-        conn.commit()
+        if tx is None:
+            conn.commit()
         return {
             "status": "ok",
             "id": new_id,
@@ -300,10 +304,30 @@ def add_transaction(
         }
 
     except Exception as e:
-        _rollback(conn)
+        if tx is None:
+            _rollback(conn)
         return _erro_banco("adicionar a transação", e)
     finally:
-        _fechar_db(conn, cur)
+        _fechar_db(None if tx else conn, cur)
+
+
+@tool("add_transaction", args_schema=AddTransactionArgs)
+def add_transaction(config: RunnableConfig, **kwargs) -> dict:
+    """Converte a moeda de origem para BRL e insere a transação no Postgres."""
+    tx = transaction_for(config)
+    try:
+        with tx.lock if tx else nullcontext():
+            result = _add_transaction_impl(**kwargs, tx=tx)
+            if tx:
+                if result.get("status") == "ok":
+                    tx.record("add_transaction", result)
+                else:
+                    tx.abort("add_transaction")
+            return result
+    except Exception:
+        if tx:
+            tx.abort("add_transaction_exception")
+        raise
 
 @tool("search_transactions", args_schema=QueryTransactionsArgs)
 def search_transactions(
@@ -313,7 +337,8 @@ def search_transactions(
     type_name: Optional[str] = None,
     category_name: Optional[str] = None,
     payment_method: Optional[str] = None,
-    limit: Optional[int] = 10
+    limit: Optional[int] = 10,
+    config: RunnableConfig = None,
 ) -> dict:
     """Consulta as transações financeiras no banco de dados Postgres com base nos filtros fornecidos sendo eles:
     texto(source_text) e tipo e datas locais (America/Sao_Paulo)."""
@@ -321,19 +346,32 @@ def search_transactions(
     inicio = _normalizar_data_local(start_date)
     fim = _normalizar_data_local(end_date)
     if (start_date and inicio is None) or (end_date and fim is None):
+        tx = transaction_for(config)
+        if tx:
+            tx.abort("search_transactions_invalid_date")
         return {"status": "error", "code": "invalid_date", "message": "Use datas válidas no formato YYYY-MM-DD ou DD/MM/YYYY."}
     if inicio and fim and inicio > fim:
+        tx = transaction_for(config)
+        if tx:
+            tx.abort("search_transactions_invalid_range")
         return {"status": "error", "code": "invalid_date_range", "message": "A data inicial não pode ser posterior à data final."}
     try:
         limite = max(1, min(int(limit or 10), 100))
     except (TypeError, ValueError):
+        tx = transaction_for(config)
+        if tx:
+            tx.abort("search_transactions_invalid_limit")
         return {"status": "error", "code": "invalid_limit", "message": "O limite deve ser um número inteiro entre 1 e 100."}
 
     conn = None
+    shared_tx = None
     cur = None
+    turno_lock = transaction_for(config)
+    if turno_lock:
+        turno_lock.lock.acquire()
 
     try:
-        conn = get_conn()
+        conn, shared_tx = connection_for_read(config)
         cur = conn.cursor()
         sql = """
         SELECT t.id, t.amount, ty.type as transaction_type, c.name as category_name,
@@ -363,6 +401,8 @@ def search_transactions(
         if type_name:
             t = TYPE_ALIASES.get(type_name.strip().upper())
             if not t:
+                if shared_tx:
+                    shared_tx.abort("search_transactions_invalid_type")
                 return {"status": "error", "code": "invalid_type", "message": "Tipo inválido: use INCOME, EXPENSES ou TRANSFER."}
             sql += " AND UPPER(ty.type) = %s"
             params.append(t)
@@ -404,18 +444,28 @@ def search_transactions(
     
     except Exception as e:
         _rollback(conn)
+        if shared_tx:
+            shared_tx.abort("search_transactions_exception")
         return _erro_banco("consultar as transações", e)
     finally:
-        _fechar_db(conn, cur)
+        try:
+            _fechar_db(None if shared_tx else conn, cur)
+        finally:
+            if turno_lock:
+                turno_lock.lock.release()
 
 @tool("saldo_total")
-def saldo_total() -> dict:
+def saldo_total(config: RunnableConfig = None) -> dict:
     """Calcula o saldo total (entradas - despesas) com base nas transações registradas. Ignore o tipo TRANSFER(3)"""
     conn = None
+    shared_tx = None
     cur = None
+    turno_lock = transaction_for(config)
+    if turno_lock:
+        turno_lock.lock.acquire()
 
     try:
-        conn = get_conn()
+        conn, shared_tx = connection_for_read(config)
         cur = conn.cursor()
         cur.execute("""
             SELECT 
@@ -431,25 +481,41 @@ def saldo_total() -> dict:
     
     except Exception as e:
         _rollback(conn)
+        if shared_tx:
+            shared_tx.abort("saldo_total_exception")
         return _erro_banco("consultar o saldo total", e)
     finally:
-        _fechar_db(conn, cur)
+        try:
+            _fechar_db(None if shared_tx else conn, cur)
+        finally:
+            if turno_lock:
+                turno_lock.lock.release()
 
 @tool("saldo_diario")
-def saldo_diario(first_date: str, last_date: Optional[str] = None) -> dict: 
+def saldo_diario(first_date: str, last_date: Optional[str] = None, config: RunnableConfig = None) -> dict:
     """Use esta tool SEMPRE que o usuário perguntar sobre saldo, balanço, entradas ou saídas de um dia ou período específico. Exemplos: 'qual meu saldo de hoje?', 'quanto gastei essa semana?', 'meu balanço de 01/03 a 15/03'. Converta datas do formato DD/MM/YYYY para YYYY-MM-DD antes de chamar."""
     inicio = _normalizar_data_local(first_date)
     fim = _normalizar_data_local(last_date)
     if inicio is None or (last_date and fim is None):
+        tx = transaction_for(config)
+        if tx:
+            tx.abort("saldo_diario_invalid_date")
         return {"status": "error", "code": "invalid_date", "message": "Use datas válidas no formato YYYY-MM-DD ou DD/MM/YYYY."}
     if fim and inicio > fim:
+        tx = transaction_for(config)
+        if tx:
+            tx.abort("saldo_diario_invalid_range")
         return {"status": "error", "code": "invalid_date_range", "message": "A data inicial não pode ser posterior à data final."}
 
     conn = None
+    shared_tx = None
     cur = None
+    turno_lock = transaction_for(config)
+    if turno_lock:
+        turno_lock.lock.acquire()
 
     try:
-        conn = get_conn()
+        conn, shared_tx = connection_for_read(config)
         cur = conn.cursor()
 
         if fim:
@@ -476,9 +542,15 @@ def saldo_diario(first_date: str, last_date: Optional[str] = None) -> dict:
         return {"status": "ok", "saldo": saldo, "total_income": total_income, "total_expenses": total_expenses}
     except Exception as e:
         _rollback(conn)
+        if shared_tx:
+            shared_tx.abort("saldo_diario_exception")
         return _erro_banco("consultar o saldo do período", e)
     finally:
-        _fechar_db(conn, cur)
+        try:
+            _fechar_db(None if shared_tx else conn, cur)
+        finally:
+            if turno_lock:
+                turno_lock.lock.release()
 
 class UpdateTransactionArgs(BaseModel):
     id: Optional[int] = Field(
@@ -502,8 +574,7 @@ class UpdateTransactionArgs(BaseModel):
     payment_method: Optional[str] = Field(default=None, description="Novo meio de pagamento.")
     occurred_at: Optional[str] = Field(default=None, description="Novo timestamp ISO 8601.")
 
-@tool("update_transaction", args_schema=UpdateTransactionArgs)
-def update_transaction(
+def _update_transaction_impl(
     id: Optional[int] = None,
     match_text: Optional[str] = None,
     date_local: Optional[str] = None,
@@ -515,6 +586,7 @@ def update_transaction(
     description: Optional[str] = None,
     payment_method: Optional[str] = None,
     occurred_at: Optional[str] = None,
+    tx: TurnTransaction | None = None,
 ) -> dict:
     """
     Atualiza uma transação existente.
@@ -549,7 +621,7 @@ def update_transaction(
     conn = None
     cur = None
     try:
-        conn = get_conn()
+        conn = tx.conn() if tx else get_conn()
         cur = conn.cursor()
         # Resolve target_id
         target_id = id
@@ -631,8 +703,6 @@ def update_transaction(
         if rows_affected == 0:
             _rollback(conn)
             return {"status": "error", "code": "not_found", "message": "Nenhuma transação encontrada com esse ID."}
-        conn.commit()
-
         # Retornar o registro atualizado
         cur.execute(
             """
@@ -660,18 +730,41 @@ def update_transaction(
                 "source_text": r[7],
             }
 
-        return {
+        result = {
             "status": "ok",
             "rows_affected": rows_affected,
             "id": target_id,
             "updated": updated
         }
+        if tx is None:
+            conn.commit()
+        return result
 
     except Exception as e:
-        _rollback(conn)
+        if tx is None:
+            _rollback(conn)
         return _erro_banco("atualizar a transação", e)
     finally:
-        _fechar_db(conn, cur)
+        _fechar_db(None if tx else conn, cur)
+
+
+@tool("update_transaction", args_schema=UpdateTransactionArgs)
+def update_transaction(config: RunnableConfig, **kwargs) -> dict:
+    """Atualiza uma transação existente e devolve o registro atualizado."""
+    tx = transaction_for(config)
+    try:
+        with tx.lock if tx else nullcontext():
+            result = _update_transaction_impl(**kwargs, tx=tx)
+            if tx:
+                if result.get("status") == "ok":
+                    tx.record("update_transaction", result)
+                else:
+                    tx.abort("update_transaction")
+            return result
+    except Exception:
+        if tx:
+            tx.abort("update_transaction_exception")
+        raise
 
 
 # Exporta a lista de tools

@@ -1,10 +1,13 @@
 from typing import Optional, List
+from contextlib import nullcontext
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 # A conexão com o Postgres agora vem de um lugar só (antes era uma get_conn()
 # local, idêntica à de financeiro.py).
 from app.tools.db import get_conn
+from app.turn_transaction import TurnTransaction, connection_for_read, transaction_for
 
 
 class AddEventArgs(BaseModel):
@@ -19,20 +22,20 @@ class AddEventArgs(BaseModel):
     notes: Optional[str] = Field(default=None, description="Observações adicionais sobre o evento.")
 
 
-@tool("add_event", args_schema=AddEventArgs)
-def add_event(
+def _add_event_impl(
     title: str,
     source_text: str,
     start_time: str,
     end_time: Optional[str] = None,
     location: Optional[str] = None,
     notes: Optional[str] = None,
+    tx: TurnTransaction | None = None,
 ) -> dict:
     """Insere um evento/compromisso na agenda (tabela events) do banco de dados Postgres."""
     conn = None
     cur = None
     try:
-        conn = get_conn()
+        conn = tx.conn() if tx else get_conn()
         cur = conn.cursor()
         cur.execute(
             """
@@ -45,7 +48,8 @@ def add_event(
             (title, start_time, end_time, location, notes, source_text),
         )
         new_id, start, end = cur.fetchone()
-        conn.commit()
+        if tx is None:
+            conn.commit()
         return {
             "status": "ok",
             "id": new_id,
@@ -54,14 +58,33 @@ def add_event(
             "end_time": str(end) if end else None,
         }
     except Exception as e:
-        if conn is not None:
+        if conn is not None and tx is None:
             conn.rollback()
         return {"status": "error", "message": str(e)}
     finally:
         if cur is not None:
             cur.close()
-        if conn is not None:
+        if conn is not None and tx is None:
             conn.close()
+
+
+@tool("add_event", args_schema=AddEventArgs)
+def add_event(config: RunnableConfig, **kwargs) -> dict:
+    """Insere um evento/compromisso na agenda (tabela events) do Postgres."""
+    tx = transaction_for(config)
+    try:
+        with tx.lock if tx else nullcontext():
+            result = _add_event_impl(**kwargs, tx=tx)
+            if tx:
+                if result.get("status") == "ok":
+                    tx.record("add_event", result)
+                else:
+                    tx.abort("add_event")
+            return result
+    except Exception:
+        if tx:
+            tx.abort("add_event_exception")
+        raise
 
 
 #############
@@ -95,6 +118,7 @@ def query_events(
     date_from_local: Optional[str] = None,
     date_to_local: Optional[str] = None,
     limit: int = 20,
+    config: RunnableConfig = None,
 ) -> dict:
     """
     Consulta eventos da agenda (tabela events) com filtros por texto e datas locais (America/Sao_Paulo).
@@ -104,11 +128,17 @@ def query_events(
       - Caso contrário: ASC também (próximos compromissos primeiro a partir do filtro).
     """
     conn = None
+    shared_tx = None
     cur = None
+    turno_lock = transaction_for(config)
+    if turno_lock:
+        turno_lock.lock.acquire()
     try:
-        conn = get_conn()
+        conn, shared_tx = connection_for_read(config)
         cur = conn.cursor()
         if date_local and (date_from_local or date_to_local):
+            if shared_tx:
+                shared_tx.abort("query_events_invalid_dates")
             return {"status": "error", "message": "Use date_local OU (date_from_local/date_to_local), não ambos."}
 
         where_sql = "WHERE 1=1"
@@ -171,12 +201,22 @@ def query_events(
         return {"status": "ok", "count": len(results), "results": results}
 
     except Exception as e:
+        if shared_tx:
+            shared_tx.abort("query_events_exception")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         return {"status": "error", "message": str(e)}
     finally:
-        if cur is not None:
-            cur.close()
-        if conn is not None:
-            conn.close()
+        try:
+            if cur is not None:
+                cur.close()
+            if conn is not None and shared_tx is None:
+                conn.close()
+        finally:
+            if turno_lock:
+                turno_lock.lock.release()
 
 
 # Exporta a lista de tools
