@@ -13,6 +13,7 @@ from app.tools.financeiro import TOOLS, add_transaction, saldo_total
 from app.tools.faq import faq_retriever
 from app.guardrail import (
     anonimizar_entrada,
+    eh_lancamento_cotidiano,
     guardrail_entrada,
     guardrail_saida,
     limpar_raciocinio,
@@ -94,6 +95,10 @@ logger = logging.getLogger(__name__)
 # NÓS
 # ==============================================================================
 def no_roteador(estado: Estado, config: RunnableConfig) -> dict:
+    indice = _indice_ultima_mensagem_usuario(estado["messages"])
+    pergunta = _texto_mensagem(estado["messages"][indice]) if indice >= 0 else ""
+    if _insercao_brl_simples(pergunta):
+        return {"agentes_chamados": ["roteador"], "rota": "financeiro"}
     saida = router_app.invoke(
         {"messages": list(estado["messages"])},
         config=config,
@@ -182,6 +187,11 @@ def _eh_pedido_de_insercao(texto: str) -> bool:
     ))
 
 
+def _insercao_brl_simples(texto: str) -> bool:
+    """Reconhece somente um lançamento explícito em reais, sem edição ou consulta."""
+    return eh_lancamento_cotidiano(texto) and _valor_insercao(texto) is not None
+
+
 def _valor_insercao(texto: str) -> float | None:
     encontrados = re.findall(
         r"(?:r\$\s*|\b)(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:reais?|rs)\b",
@@ -259,12 +269,27 @@ def _fallback_insercao(texto: str, config: RunnableConfig) -> tuple[dict, dict] 
     tipo = "INCOME" if any(palavra in texto_lower for palavra in ("ganhei", "recebi", "salário", "salario", "receita")) else "EXPENSES"
     data = _data_insercao(texto)
     ocorreu_em = f"{data}T12:00:00-03:00" if data else None
+    item = re.search(
+        r"\bcom\s+(café|cafe|almoço|almoco|lanche|jantar|mercado|padaria|"
+        r"transporte|ônibus|onibus|livro)\b",
+        texto,
+        re.IGNORECASE,
+    ) if _insercao_brl_simples(texto) else None
+    descricao = item.group(1) if item else texto
+    categoria = (
+        "comida" if item and item.group(1).casefold() in
+        {"café", "cafe", "almoço", "almoco", "lanche", "jantar", "mercado", "padaria"}
+        else "transporte" if item and item.group(1).casefold() in
+        {"transporte", "ônibus", "onibus"}
+        else "estudo" if item else None
+    )
     resultado = add_transaction.invoke({
         "amount": valor,
         "source_text": texto,
         "occurred_at": ocorreu_em,
         "type_name": tipo,
-        "description": texto,
+        "description": descricao,
+        "category_name": categoria,
     }, config=config)
     if resultado.get("status") == "ok":
         especialista = {
@@ -381,7 +406,20 @@ def _abortar_se_tool_falhou(mensagens, config: RunnableConfig) -> None:
 def no_financeiro(estado: Estado, config: RunnableConfig) -> dict:
     """Executa o especialista e impede uma resposta sem consulta em saldo total."""
     indice = _indice_ultima_mensagem_usuario(estado["messages"])
-    pedido = _texto_mensagem(estado["messages"][indice]).casefold() if indice >= 0 else ""
+    pedido_original = _texto_mensagem(estado["messages"][indice]) if indice >= 0 else ""
+    pedido = pedido_original.casefold()
+    if _insercao_brl_simples(pedido_original):
+        fallback = _fallback_insercao(pedido_original, config)
+        if fallback is not None:
+            especialista, evidencia = fallback
+            return {
+                "agentes_chamados": ["financeiro"],
+                "messages": [{"role": "assistant", "content": json.dumps(especialista, ensure_ascii=False)}],
+                "evidencias_tools": [{
+                    "name": "add_transaction",
+                    "content": json.dumps(_evidencia_add_transaction(evidencia), ensure_ascii=False),
+                }],
+            }
     if (
         any(campo in pedido for campo in ("perfil", "renda mensal", "tolerância", "tolerancia", "preferências", "preferencias", "meu objetivo"))
         and re.search(
@@ -614,7 +652,8 @@ def decidir_pos_guardrail_entrada(estado: Estado) -> str:
 
 def no_guardrail_entrada(estado: Estado, config: RunnableConfig) -> dict:
     """Executa o guardrail de entrada e decide se o fluxo continua ou é bloqueado."""
-    if transaction_for(config) is None:
+    tx = transaction_for(config)
+    if tx is None:
         raise RuntimeError("O turno do chat precisa de uma transação gerenciada.")
 
     puser = estado["messages"][-1]
@@ -633,6 +672,10 @@ def no_guardrail_entrada(estado: Estado, config: RunnableConfig) -> dict:
                 }
             ],
         }
+
+    # A origem gravada pelas tools deve ser a pergunta anonimizada do turno,
+    # não uma paráfrase escolhida pelo modelo.
+    tx.source_text = mensagem_anonimizada
 
     configuravel = (config or {}).get("configurable", {})
     session_id = configuravel.get("thread_id")

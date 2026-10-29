@@ -151,6 +151,26 @@ class TurnWriteInvariantTests(unittest.TestCase):
                 self.assertEqual(connection.rollbacks, 1)
                 self.assertEqual(connection.closes, 1)
 
+    def test_origem_do_lancamento_vem_do_turno_e_nao_do_modelo(self):
+        turn, connection = self._turn("ORIGEM-TURNO")
+        turn.source_text = "Gastei R$ 5,00 com café. ORIGEM-TURNO"
+        with patch(
+            "app.tools.financeiro.converter_para_brl",
+            return_value=ConversionResult(5.0, "BRL", 5.0, 1.0, "2026-10-29"),
+        ):
+            result = add_transaction.invoke(
+                {
+                    "amount": 5,
+                    "currency": "BRL",
+                    "source_text": "Paráfrase sem o marcador",
+                    "type_name": "EXPENSES",
+                },
+                config=_config(turn),
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(connection.cursor_instance.params[-1], turn.source_text)
+        self.assertEqual(turn.finish(False), "rolled_back")
+
     def test_erro_sql_aborta_e_desfaz_as_tres_tools(self):
         for name in self.WRITES:
             with self.subTest(tool=name):

@@ -22,6 +22,7 @@ class TurnTransaction:
     connection: Any = None
     aborted: bool = False
     reason: str = ""
+    source_text: str | None = None
     writes: list[dict] = field(default_factory=list)
     finished: bool = False
     lock: Any = field(default_factory=threading.RLock)

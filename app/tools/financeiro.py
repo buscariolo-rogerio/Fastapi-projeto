@@ -317,6 +317,8 @@ def add_transaction(config: RunnableConfig, **kwargs) -> dict:
     tx = transaction_for(config)
     try:
         with tx.lock if tx else nullcontext():
+            if tx and tx.source_text:
+                kwargs["source_text"] = tx.source_text
             result = _add_transaction_impl(**kwargs, tx=tx)
             if tx:
                 if result.get("status") == "ok":

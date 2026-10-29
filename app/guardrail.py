@@ -153,6 +153,21 @@ _RESPOSTAS_BLOQUEIO = {
     "INDICACAO_INVEST": ("indicacao_investimento",   "Por regulação, não forneço indicações diretas de ativos. Posso explicar classes de investimento ou agendar uma reunião com seu assessor."),
 }
 
+# Lançamentos cotidianos com formato fechado dispensam uma classificação
+# semântica remota. As verificações de injeção e acesso interno acima continuam
+# obrigatórias; qualquer texto fora deste padrão segue para o classificador.
+_LANCAMENTO_COTIDIANO = re.compile(
+    r"\s*(?:gastei|paguei|comprei)\s+R\$\s*\d+(?:[.,]\d{1,2})?\s+"
+    r"com\s+(?:café|cafe|almoço|almoco|lanche|jantar|mercado|padaria|"
+    r"transporte|ônibus|onibus|livro)\s*(?:hoje|ontem)?\.?\s*"
+    r"(?:registre\s+como\s+[A-Za-z0-9-]+\.)?\s*",
+    re.IGNORECASE,
+)
+
+
+def eh_lancamento_cotidiano(texto: str) -> bool:
+    return bool(_LANCAMENTO_COTIDIANO.fullmatch(texto))
+
 def guardrail_entrada(mensagem_anonimizada):
     """
     Executa as verificações de entrada em ordem de custo crescente:
@@ -169,6 +184,9 @@ def guardrail_entrada(mensagem_anonimizada):
     for kw in _KEYWORDS_DADOS_INTERNOS:
         if kw in texto_lower:
             return _bloquear("acesso_dados_internos", "Não tenho como compartilhar informações internas do sistema.")
+
+    if eh_lancamento_cotidiano(mensagem_anonimizada):
+        return _aprovado()
 
     # 3. Classificação semântica via LLM (ofensivo, perigoso, ilícito, político, indicação)
     resposta = llm.invoke(_PROMPT_CLASSIFICADOR.format(mensagem=mensagem_anonimizada)).content
@@ -217,6 +235,10 @@ def guardrail_saida(resposta, mapa_pii, restaurar_pii=False):
 
     # 2. Resolve tokens de PII da entrada
     resposta = desanonimizar_saida(resposta, mapa_pii, restaurar=restaurar_pii)
+    # Confirmações geradas pelo código a partir da tool não contêm conselho de
+    # investimento nem previsão de mercado; a revisão por modelo é desnecessária.
+    if re.fullmatch(r"Registrei a transação de R\$ [\d.,]+ no banco de dados\.", resposta):
+        return _saida_ok(normalizar_resposta_usuario(resposta))
 
     # 3. Revisão de compliance financeiro
     saida = llm.invoke(_PROMPT_COMPLIANCE.format(resposta=resposta)).content.strip()

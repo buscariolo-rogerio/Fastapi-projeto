@@ -83,7 +83,10 @@ A linha de base está no commit `eceb2c3`: `add_transaction`, `update_transactio
 
 - `python -m pytest -q`: **26 testes passaram**, com **20 subtestes**, incluindo as três escritas, recusa, aprovação, erros, timeout, repetição e concorrência.
 - A linha de base anterior à solução permanece identificável pelo commit `eceb2c3`.
-- Não foi feita escrita em banco de produção nem medição com serviços externos nesta execução.
+- Teste integrado posterior no PostgreSQL configurado: uma inserção recusada pelo JEV real gerou ID provisório e terminou em rollback; a consulta por esse ID retornou zero linhas.
+- Teste integrado posterior de aprovação pelo JEV real: inserção confirmada por commit, com valor, descrição, categoria e texto de origem conferidos pelo ID e marcador exclusivos. A linha de teste foi removida em seguida.
+- No caminho de lançamento cotidiano em reais, o monitor mediu 3,96 s no turno aprovado (limite de p95: 8 s). Esta amostra isolada não garante o SLO sob carga ou com falhas externas.
+- O MongoDB Atlas apresentou falha de resolução DNS no ambiente de teste; a memória persistente não foi validada nessa execução.
 
 ## Arquivos criados
 
