@@ -13,6 +13,8 @@ import urllib.request
 from typing import Any
 
 from app.config import TYPESAFE_API_KEY
+from app.turn_transaction import transaction_for
+from langchain_core.runnables import RunnableConfig
 
 
 logger = logging.getLogger(__name__)
@@ -101,20 +103,32 @@ def _coleta(estado: dict) -> tuple[str, str, str]:
             if texto:
                 resposta = texto
 
+    # O nó financeiro normaliza a resposta do especialista e não conserva
+    # seus ToolMessages internos no histórico do grafo. O resultado real de
+    # add_transaction é transportado separadamente no estado deste turno.
+    for evidencia_tool in estado.get("evidencias_tools", []):
+        if not isinstance(evidencia_tool, dict):
+            continue
+        nome = str(evidencia_tool.get("name") or "tool")
+        conteudo = str(evidencia_tool.get("content") or "").strip()
+        if conteudo:
+            evidencias.append(f"[{nome}]\n{conteudo}")
+
     evidencia = "\n\n".join(evidencias).strip()
     if not evidencia:
         evidencia = "(nenhuma tool devolveu conteúdo neste turno)"
     return pergunta, resposta, evidencia[-6000:]
 
 
-def _publicar(texto: str, rotulo: str, resposta_original: str) -> dict:
+def _publicar(texto: str, rotulo: str, resposta_original: str, veredito: str = "recusado") -> dict:
     logger.info("[juiz] %s", rotulo)
     texto_final = texto.strip()
     if texto_final == (resposta_original or "").strip():
-        return {"agentes_chamados": [f"juiz:{rotulo}"]}
+        return {"agentes_chamados": [f"juiz:{rotulo}"], "veredito_turno": veredito}
     return {
         "messages": [{"role": "assistant", "content": texto_final}],
         "agentes_chamados": [f"juiz:{rotulo}"],
+        "veredito_turno": veredito,
     }
 
 
@@ -139,7 +153,7 @@ def _requisicao_jev(corpo: dict) -> dict:
 
 def _julgar_jev(pergunta: str, resposta: str, evidencia: str) -> dict:
     if not TYPESAFE_API_KEY:
-        return _publicar(FRASE_SEGURA, "sem_chave", resposta)
+        return _publicar(FRASE_SEGURA, "sem_chave", resposta, "falha")
 
     corpo = {
         "model": JEV_MODELO,
@@ -177,26 +191,29 @@ def _julgar_jev(pergunta: str, resposta: str, evidencia: str) -> dict:
         noul = float(respostas["apoiada"]["noul"])
     except urllib.error.HTTPError as exc:
         logger.warning("[juiz] erro HTTP %s", exc.code)
-        return _publicar(FRASE_SEGURA, f"erro_http_{exc.code}", resposta)
+        return _publicar(FRASE_SEGURA, f"erro_http_{exc.code}", resposta, "falha")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.warning("[juiz] erro de conexão: %s", type(exc).__name__)
-        return _publicar(FRASE_SEGURA, "erro_conexao", resposta)
+        return _publicar(FRASE_SEGURA, "erro_conexao", resposta, "falha")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("[juiz] resposta inválida: %s", type(exc).__name__)
-        return _publicar(FRASE_SEGURA, "resposta_invalida", resposta)
+        return _publicar(FRASE_SEGURA, "resposta_invalida", resposta, "falha")
 
     if choice == "apoiada" and noul >= LIMIAR:
-        return _publicar(resposta, f"apoiada_noul={noul:.2f}", resposta)
+        return _publicar(resposta, f"apoiada_noul={noul:.2f}", resposta, "aprovado")
     rotulo = "apoiada_abaixo_do_limiar" if choice == "apoiada" else choice
     return _publicar(FRASE_SEGURA, f"{rotulo}_noul={noul:.2f}", resposta)
 
 
-def no_juiz(estado: dict) -> dict:
+def no_juiz(estado: dict, config: RunnableConfig) -> dict:
     pergunta, resposta, evidencia = _coleta(estado)
+    tx = transaction_for(config)
+    if tx and tx.aborted:
+        return _publicar("Não consegui concluir a operação no banco de dados.", "erro_tool", resposta, "falha")
     if not resposta:
-        return {"agentes_chamados": ["juiz:sem_resposta"]}
+        return {"agentes_chamados": ["juiz:sem_resposta"], "veredito_turno": "falha"}
     try:
         return _julgar_jev(pergunta, resposta, evidencia)
     except Exception as exc:  # defesa final: falhar fechado sem expor dados
         logger.exception("[juiz] falha inesperada: %s", type(exc).__name__)
-        return _publicar(FRASE_SEGURA, "erro", resposta)
+        return _publicar(FRASE_SEGURA, "erro", resposta, "falha")

@@ -229,6 +229,11 @@ def fechar_turno(turno_id: str, session_id: str, rota: str, status: str) -> None
 
 
 def status_do_estado(estado: dict) -> str:
+    resultado = estado.get("resultado_transacao")
+    if resultado in ("erro", "uncertain") or estado.get("veredito_turno") == "falha":
+        return "erro"
+    if estado.get("veredito_turno") == "recusado":
+        return "bloqueado"
     agentes = estado.get("agentes_chamados") or []
     for nome in agentes:
         if isinstance(nome, str) and nome.startswith("guardrail_entrada:"):

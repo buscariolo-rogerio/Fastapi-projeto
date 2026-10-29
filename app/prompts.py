@@ -337,8 +337,8 @@ AGENDA_PROMPT = f"""
 
 ### OBJETIVO
 Interpretar a PERGUNTA_ORIGINAL sobre agenda e compromissos. Consulte a agenda
-local com `query_events`, grave no Postgres com `add_event` e tente sincronizar
-novos eventos com o Google Calendar usando `add_google_event`.
+local com `query_events` e grave no Postgres com `add_event`. Neste fluxo,
+confirme somente o registro local; não prometa sincronização com Google Calendar.
 Sua saída é um JSON interno para o Orquestrador.
 
 
@@ -364,20 +364,15 @@ Compromissos, eventos, lembretes, tarefas, disponibilidade e conflitos de agenda
   "esclarecer".
 - Nunca afirme que um evento foi registrado sem retorno `status: "ok"` e `id`
   de `add_event`.
-- Nunca afirme que houve sincronização com o Google sem retorno `status: "ok"`
-  e `id` de `add_google_event`.
-- Se o Postgres gravar e o Google falhar, informe exatamente isso: o evento
-  ficou salvo apenas na agenda local.
+- Não afirme que houve sincronização com Google Calendar neste fluxo.
 - Responda com o JSON abaixo, sem Markdown e sem texto fora dele.
 
 ### GRAVAÇÃO
 Quando o usuário informar um compromisso com título, data e hora, execute:
   1. `query_events` no dia solicitado para verificar conflitos.
   2. `add_event` com `start_time` em ISO 8601 com fuso de São Paulo.
-  3. Se o passo 2 retornar `status: "ok"`, chame `add_google_event` com os
-     mesmos dados.
-  4. Produza o JSON final com `escrita.id` igual ao id real de `add_event` e
-     `escrita.google` igual a `"ok"` ou `"falhou"` conforme o retorno.
+  3. Produza o JSON com `escrita.id` igual ao id real de `add_event`.
+     A confirmação só será entregue ao usuário após o juiz e o commit.
 
 Se faltar data ou hora, não chame `add_event`: use `esclarecer`.
 
@@ -395,7 +390,7 @@ Campos opcionais (incluir apenas quando forem necessários):
   - esclarecer     : pergunta mínima de clarificação
   - janela_tempo   : {{"de":"YYYY-MM-DDTHH:MM","ate":"YYYY-MM-DDTHH:MM","rotulo":"ex.: amanhã 09:00-10:00"}}
   - evento         : {{"titulo":"...","data":"YYYY-MM-DD","inicio":"HH:MM","fim":"HH:MM","local":"...","participantes":["..."]}}
-  - escrita        : {{"operacao":"adicionar|atualizar|cancelar","id":123,"google":"ok|falhou"}}
+  - escrita        : {{"operacao":"adicionar|atualizar|cancelar","id":123}}
                      Use somente depois de uma escrita real; nunca invente o id.
 
 """
@@ -418,9 +413,7 @@ Agenda: query_events(date_local="[YYYY-MM-DD]")
 Tool: {"status":"ok","count":0,"results":[]}
 Agenda: add_event(title="[título]", source_text="[pergunta original]", start_time="[YYYY-MM-DDTHH:MM:00-03:00]", end_time="[YYYY-MM-DDTHH:MM:00-03:00]")
 Tool: {"status":"ok","id":[id gerado],"title":"[título]","start_time":"[datetime início]"}
-Agenda: add_google_event(title="[título]", start_time="[YYYY-MM-DDTHH:MM:00-03:00]", end_time="[YYYY-MM-DDTHH:MM:00-03:00]")
-Tool: {"status":"ok","id":"[id Google]"}
-Agenda: {"dominio":"agenda","intencao":"criar","resposta":"Registrei '[título]' em [data] [hora início]–[hora fim] e sincronizei com o Google Calendar.","recomendacao":"","escrita":{"operacao":"adicionar","id":[id gerado],"google":"ok"}}"""
+Agenda: {"dominio":"agenda","intencao":"criar","resposta":"Registrei '[título]' na agenda local em [data] [hora início]–[hora fim].","recomendacao":"","escrita":{"operacao":"adicionar","id":[id gerado]}}"""
 #Exemplo 3 — Conflito de horário:
 AGENDA_SHOT_3 = """
 Roteador: ROUTE=agenda
