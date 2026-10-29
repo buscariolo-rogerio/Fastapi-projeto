@@ -29,6 +29,14 @@ Uma exceção durante `commit` é tratada como resultado incerto. A resposta nã
 - Usa transações PostgreSQL e `commit`/`rollback` já disponíveis no driver. Não exige nova tecnologia, um segundo banco, uma camada adicional de acesso a dados ou outra tool visível ao modelo.
 - Permite condicionar a permanência da escrita ao valor estruturado `veredito_turno` produzido pelo juiz.
 
+## Alternativas avaliadas e não escolhidas
+
+Só **Transacionar** foi implementado. As demais famílias foram avaliadas, mas não coexistem no código:
+
+- **Interceptar antes da tool:** o JEV avaliaria a intenção antes de qualquer SQL. A vantagem seria não manter conexão e locks abertos durante a chamada externa. O custo é julgar uma ação ainda sem o retorno real do banco — ID, valor convertido, linha localizada e erros SQL ainda não existem — e depois precisar de outra verificação para a frase final. Ficou de fora porque enfraquece justamente a evidência usada pelo juiz.
+- **Adiar como operação preparada:** cada tool devolveria um comando ou objeto de mudança, e outra camada executaria o SQL após aprovação. A vantagem é não segurar transação durante o JEV. O custo é duplicar o contrato de cada escrita e reimplementar resolução de tipo, categoria, linha-alvo e retorno real fora das tools atuais. Ficou de fora porque exigiria refatoração maior e mudaria a responsabilidade das três tools.
+- **Compensar depois do commit:** a escrita seria confirmada imediatamente e uma operação inversa tentaria desfazê-la na recusa. A vantagem é conexão curta. O custo é haver uma janela em que o dado recusado fica visível, além de exigir guardar o estado anterior completo de `update_transaction`; a compensação também pode falhar. Ficou de fora porque não garante a invariante com a mesma força de um rollback PostgreSQL.
+
 ## Propriedade da conexão
 
 Cada chamada de chat registra um gestor de transação no runtime. O identificador segue no `RunnableConfig`, sem colocar uma conexão não serializável no estado do LangGraph. As tools resolvem o gestor por esse identificador. A conexão abre sob demanda na primeira escrita, permanece aberta enquanto especialista, orquestrador, guardrail e JEV trabalham, e fecha ao terminar a transação. Uma aresta condicional do LangGraph encaminha o veredito aprovado ao nó de commit e os demais resultados ao nó de rollback.
@@ -57,19 +65,30 @@ O chat não chama Google Calendar antes nem depois do JEV. O especialista de age
 
 O monitor usa o veredito e o resultado final da transação para diferenciar aprovação confirmada, recusa e falha operacional. A medição de turno inclui o período até o `commit` ou `rollback`. A conexão permanece aberta durante a chamada externa do JEV, então a latência completa e o p95 precisam ser observados no ambiente integrado; não foi medida uma linha de base com PostgreSQL de teste nesta execução.
 
+Na solução escolhida, o JEV já existia e não há uma chamada de modelo adicional: tokens e custo do turno permanecem os das chamadas já presentes. A latência medida passa a incluir o finalizador e o tempo de `commit`/`rollback`; o principal risco ao SLO de p95 de 8 s é manter a conexão/lock enquanto o JEV responde. Aprovação confirmada é `ok`, recusa do JEV é `bloqueado`, e timeout, erro do JEV, falha SQL ou resultado incerto é `erro`; bloqueio do guardrail de entrada continua fora da taxa de erro.
+
+Na alternativa de **Compensar**, haveria um segundo efeito SQL após a recusa. Isso aumentaria a latência dos turnos recusados e poderia elevar a taxa de erro se a compensação falhasse; tokens e custo de modelo não mudariam, mas o turno só poderia ser marcado como `bloqueado` depois de a compensação ser confirmada. Se ela falhasse, o status correto seria `erro`, não `bloqueado`.
+
+O Mongo mantém a pergunta anonimizada registrada na entrada e salva a resposta exibida somente depois da finalização. Essa escrita não participa da transação PostgreSQL; uma falha ao salvar a resposta é registrada sem induzir repetição de uma operação já confirmada. O Google Calendar ficou fora do chat porque não há transação distribuída entre Google e PostgreSQL; `add_google_event` continua disponível apenas fora desse fluxo automático.
+
+Se o processo cair antes do finalizador, o fechamento da conexão pelo processo/PostgreSQL desfaz a transação não confirmada; se cair durante o `commit`, o resultado permanece incerto e exige consulta antes de repetir. Uma repetição HTTP é tratada como um novo pedido porque `/chat` ainda não recebe chave de idempotência.
+
+## Evidência reproduzível
+
+A linha de base está no commit `eceb2c3`: `add_transaction`, `update_transaction` e `add_event` continham `commit()` dentro das tools, e o grafo ligava `juiz` diretamente ao fim. A implementação atual é comparada a essa revisão pelo histórico Git.
+
+`tests/test_turn_transaction.py` usa marcadores únicos (`APROVA-*`, `RECUSA-*`, `ERRO-SQL-*`, `POS-SQL-*` e `CONCORRENTE-*`) e conexões simuladas. Para cada uma das três tools, prova que antes do veredito há zero commits; aprovação confirma exatamente uma vez; recusa, erro SQL e exceção depois do SQL executam rollback e nenhum commit. O mesmo arquivo cobre finalização duplicada e isolamento entre turnos concorrentes. `tests/test_juiz.py` cobre timeout do JEV como veredito `falha`, que segue para rollback.
+
 ## Validação
 
-- `openspec validate --specs --strict` passou: 1 spec validada.
-- `openspec validate defer-chat-writes-until-jev --strict` passou.
-- A análise sintática Python passou para os sete arquivos alterados ou criados em `app/`.
-- Uma rodada anterior da implementação executou `python -m pytest -q`: 27 testes passaram. Essa rodada antecede os ajustes finais de transporte de evidência e serialização de leituras; a tarefa de regressão final permanece pendente.
+- `python -m pytest -q`: **26 testes passaram**, com **20 subtestes**, incluindo as três escritas, recusa, aprovação, erros, timeout, repetição e concorrência.
+- A linha de base anterior à solução permanece identificável pelo commit `eceb2c3`.
 - Não foi feita escrita em banco de produção nem medição com serviços externos nesta execução.
 
 ## Arquivos criados
 
 - `app/turn_transaction.py` — gestor da conexão e da decisão final de commit ou rollback por turno.
 - `tests/test_turn_transaction.py` — testes com conexão simulada para o ciclo transacional.
-- `openspec/specs/chat-write-authorization/spec.md` — spec principal que substitui o marcador anterior no diretório `openspec/specs/`.
 - `decisao_tecnica.md` — este registro das decisões, falhas, limites e arquivos.
 
 ## Arquivos modificados
@@ -80,10 +99,11 @@ O monitor usa o veredito e o resultado final da transação para diferenciar apr
 - `app/prompts.py` — remove promessas de sincronização com Google Calendar no chat.
 - `app/tools/agenda.py` — executa `add_event` na transação do chat, mantém commit próprio fora do chat e compartilha a conexão nas leituras do turno.
 - `app/tools/financeiro.py` — adapta `add_transaction` e `update_transaction`, compartilha a conexão de leitura e mantém commit próprio fora do chat.
+- `.gitignore` — permite versionar os testes e as especificações do projeto, mantendo caches e relatórios gerados ignorados.
+- `tests/test_juiz.py` — prova que timeout do JEV falha fechado e produz veredito de falha.
 - `openspec/changes/defer-chat-writes-until-jev/proposal.md` — descreve a mudança para Transacionar e o envio autorizado da evidência de `add_transaction` ao JEV.
 - `openspec/changes/defer-chat-writes-until-jev/design.md` — registra propriedade da conexão, fluxo de decisão, escopo do payload e riscos.
 - `openspec/changes/defer-chat-writes-until-jev/tasks.md` — marca as partes implementadas e mantém pendentes linha de base e regressão final.
 - `openspec/changes/defer-chat-writes-until-jev/specs/chat-write-authorization/spec.md` — atualiza o contrato delta, incluindo o retorno do fallback como evidência.
-- `openspec/specs/.gitkeep` — removido porque o diretório agora contém a spec principal.
 
 As rotas e o contrato público da API não foram modificados.

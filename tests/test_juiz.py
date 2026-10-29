@@ -70,6 +70,14 @@ class JudgeEvidenceTests(unittest.TestCase):
         self.assertEqual(resultado["messages"][0]["content"], FRASE_SEGURA)
         self.assertIn("juiz:sem_apoio_noul=0.12", resultado["agentes_chamados"])
 
+    @patch("app.juiz.TYPESAFE_API_KEY", "chave-de-teste")
+    @patch("app.juiz._requisicao_jev", side_effect=TimeoutError("timeout"))
+    def test_timeout_falha_fechado_e_exige_rollback(self, _requisicao):
+        resultado = _julgar_jev("registre", "Registrei.", "tool status ok")
+        self.assertEqual(resultado["messages"][0]["content"], FRASE_SEGURA)
+        self.assertEqual(resultado["veredito_turno"], "falha")
+        self.assertIn("juiz:erro_conexao", resultado["agentes_chamados"])
+
 
 if __name__ == "__main__":
     unittest.main()

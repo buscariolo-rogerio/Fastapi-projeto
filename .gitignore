@@ -23,16 +23,12 @@ ENV/
 build/
 dist/
 
-# Testes e relatórios gerados
-tests/
+# Relatórios gerados por testes
 .pytest_cache/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
-
-# Especificações mantidas apenas no workspace local
-specs/
 
 # Ferramentas locais de desenvolvimento
 /.agents/
